@@ -1,0 +1,963 @@
+---
+title: "Code for a posteriori dietary pattern analysis using Dirichlet Multinomial Mixture Models, and associations with 16S gut microbome"
+subtitle: "Cotillard et al., A posteriori dietary patterns better explain variations of the gut microbiome than individual markers in the American Gut Project, submitted to AJCN"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.height=5)
+```
+
+
+This code is licensed under the GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+
+The objective of this code is to reproduce the building of the 5 dietary patterns (DP5) obtained via Dirichlet Multinomial Mixture (DMM) models in Cotillard at al., A posteriori dietary patterns better explain variations of the gut microbiome than individual markers in the American Gut Project, submitted to AJCN. It also includes code for associations with 16S gut microbiome using DESeq2.
+
+# Initializations
+
+We first load the required librairies and datasets.
+
+The data includes 1,800 participants from the American Gut Project (AGP) database having filled a VioScreen^TM^ food frequency questionnaire and are the following:
+
+* Participants metadata ie. answers to the general AGP questionnaire (N=1,800) - .csv file
+* Food groups as described in the associated paper and expressed in daily Kcal/day (N=1,800) - .csv file
+* Correspondence between VioScreen IDs, the Sample IDs used for metadata selection (e.g. could be a non-stool samples), and the Sample IDs used for crossing with gut microbiome data
+* Microbiome data in 3 parts (N=744)
+  + Alpha-diversity indices - .csv file
+  + Beta-diversity indices - .RData with a list of matrices
+  + Prefiltered Genera - .RData with a phyloseq object
+
+
+```{r results="hide"}
+# Import librairies
+library(ggplot2)
+library(glue)
+library(fpc)
+library(DirichletMultinomial)
+library(scales)
+library(dplyr)
+library(effsize)
+library(matrixStats)
+library(DT)
+library(compareGroups)
+library(multcompView)
+library(gtools)
+library(reshape2)
+library(vegan)
+library(phyloseq)
+library(DESeq2)
+
+# Load data
+metadata <- read.csv("Data/MetadataClean.csv", stringsAsFactors=TRUE)
+FoodGroupsdata <- as.matrix(read.csv("Data/FoodGroupsKcal.csv",row.names=1))
+CorrespSamples <- read.csv("Data/VioscreenIDsCorresp.csv", colClasses="character", na.strings = "")
+alpha <- read.csv("Data/AlphaDiv.csv", colClasses=c(SAMPLE_NAME="character"))
+load("Data/BetaDiv.RData")
+load("Data/Genera.RData")
+```
+
+
+# Building the DP5 dietary patterns
+
+The first step will be to build the DP5 patterns as presented in the associated paper. For that we will use DMM models.
+
+## Building the DMM models for several numbers of components
+
+This kind of models require to choose the number of components (or diet patterns). We thus first define the range for the numbers of components that will be explored.
+
+```{r}
+# Define the range of components explored
+k_range=1:20
+```
+
+
+Then, we will perform the analysis for K=`r k_range[1]` to K=`r k_range[length(k_range)]` components.
+
+```{r eval=FALSE}
+# (Not run - Too long)
+# Set random seed
+set.seed(01121983)
+
+# Fit models and keep the seed used for reproducibility reasons
+fit_list = vector("list",20)
+my_seeds <- vector("list",20)
+for (k in k_range) {
+  print(glue("k={k}"))
+  my_seeds[[k]] <- .Random.seed
+  fit_list[[k]] <- dmn(FoodGroupsdata,k=k,verbose=FALSE)
+}
+```
+
+```{r}
+# Load precomputed results
+load(file="Results/FoodGroupsKcal_Results_DMM.RData")
+```
+
+## Choosing the optimal number of components
+
+### Laplace approximation criteria
+
+We can then plot the Laplace approximation criteria as a function of the number of components. Usually, we would use the number of components that minimizes this criteria.
+
+```{r}
+# Get Laplace scores
+lplc <- unlist(lapply(fit_list, function(x){attr(x,"goodnessOfFit")[["Laplace"]]}))
+data_plot <- data.frame(k_range=k_range,lplc=lplc)
+```
+
+```{r echo=FALSE}
+# Plot Laplace scores
+ggplot(data_plot, aes(x=k_range, y=lplc)) +
+  geom_point(size=3) +
+  geom_line(lwd=1) +
+  scale_x_continuous(name="Number of components") +
+  scale_y_continuous(name="Laplace approximation criteria",
+                     label= function(x) {ifelse(x==0, "0", parse(text=gsub("[+]", "", gsub("e", " %*% 10^", scientific_format()(x)))))} ) +
+  ggtitle("Model selection criteria") +
+  theme_classic() +
+  theme(plot.title = element_text(size=17, face="bold", hjust=0.5),
+        axis.title = element_text(size=15),
+        axis.text.x = element_text(size=12, margin = margin(t = 2, r = 0, b = 5, l = 0)),
+        axis.text.y = element_text(size=12, margin = margin(t = 0, r = 2, b = 0, l = 5)))
+```
+
+There is however here no pronounced minimum that would define a clear-cut optimal clustering. As described in the associated paper, we will thus use an approach based on robustness to define the number of diet patterns.
+
+
+### Robustness analysis
+
+We decided to choose the largest number of components (or diet patterns) that allowed a mean stability above 0.6 in each component (as evaluated by the Jaccard similarity after boostrap sampling). Since this is quite computing-intensive, we will first run the robustness analysis using 20 bootstrap samples up until the observed minimum in the Laplace graphic (ie K=`r which.min(lplc)`). We will then focus on the most relevant range with more bootstrap samples.
+
+```{r eval=FALSE}
+# (Not run - Too long)
+# Create dmn function to use with clusterboot
+# - data: data matrix
+# - k: nb of components
+dmnCBI <- function(data,k) {
+  # Launch DMM
+  res_DMM <- dmn(data,k=k)
+  clus_res <- mixture(res_DMM,assign = TRUE)
+  # Get the list of clusters as boolean
+  clus_list <- vector(mode="list",length=k)
+  names(clus_list) <- 1:k
+  for (i in 1:k) {
+    clus_list[[i]] <- clus_res==i
+  }
+  # Output results
+  return(list("result"=res_DMM,"nc"=length(levels(factor(clus_res))),
+              "clusterlist"=clus_list,"partition"=clus_res,"clustermethod"="DMN"))
+}
+
+# Run the 20 boostraps
+k_max <- which.min(lplc)
+b_nb <- 20
+res_boot <- vector(mode="list",length=k_max)
+names(res_boot) <- 1:k_max
+sizes <- res_boot
+for (k in 1:k_max) {
+  print(glue("k={k}"))
+  .Random.seed <- my_seeds[[k]]
+  DMM_boot_eval <- clusterboot(FoodGroupsdata, B=b_nb, bootmethod="boot", bscompare=TRUE, multipleboot=TRUE, clustermethod=dmnCBI, k=k)
+  res_boot[[k]] <- DMM_boot_eval$bootmean
+  sizes[[k]] <- summary(factor(DMM_boot_eval$partition))
+}
+```
+
+```{r}
+# Load precomputed results
+load(file="Results/FoodGroupsKcal_DMM_Boot20.Rdata")
+```
+
+The output of this analysis is the mean stability (over 20 bootstrap samples) for each of the K generated component from K=1 to K=`r which.min(lplc)`. We can then plot the distribution of this mean stability depending on the number of components chosen.
+
+```{r}
+# Format data to plot
+data_stab <- data.frame(Nb_Comp = rep(names(res_boot), sapply(res_boot, length)),
+                 Stability = unlist(res_boot))
+data_stab$Nb_Comp <- factor(as.numeric(data_stab$Nb_Comp))
+```
+
+```{r echo=FALSE}
+# Plot
+ggplot(data=data_stab, aes(x=Nb_Comp, y=Stability)) +
+  geom_boxplot() +
+  geom_hline(yintercept=0.6, color="red", lwd=1) +
+  geom_text(aes(0, 0.6), label=0.6, vjust=-0.5, hjust=-0.5, color="red") +
+  ggtitle("Stability criteria - 20 bootstrap samples") +
+  scale_x_discrete(name="Number of components") +
+  scale_y_continuous(name="Mean stability by component", limits=c(0,1)) +
+  theme(plot.title = element_text(size=17, face="bold", hjust=0.5),
+        axis.title = element_text(size=15),
+        axis.text.x = element_text(size=12, margin = margin(t = 2, r = 0, b = 5, l = 0)),
+        axis.text.y = element_text(size=12, margin = margin(t = 0, r = 2, b = 0, l = 5)))
+```
+
+We can see from this graphic that K=5 components is probably a good choice, but we will confirm this with more bootstrap samples focusing on the range K=4 to K=7 components.
+
+```{r}
+# Define the new range of components explored
+k_range2=4:7
+```
+
+```{r eval=FALSE}
+# (Not run - Too long)
+# Run the 50 boostraps
+b_nb2 <- 50
+res_boot2 <- vector(mode="list",length=length(k_range2))
+names(res_boot2) <- k_range2
+sizes2 <- res_boot2
+for (i in 1:length(k_range2)) {
+  k <- k_range2[i]
+  print(glue("k={k}"))
+  .Random.seed <- my_seeds[[k]]
+  DMM_boot_eval <- clusterboot(FoodGroupsdata, B=b_nb2, bootmethod="boot", bscompare=TRUE, multipleboot=TRUE, clustermethod=dmnCBI, k=k)
+  res_boot2[[i]] <- DMM_boot_eval$bootmean
+  sizes2[[i]] <- summary(factor(DMM_boot_eval$partition))
+}
+```
+
+```{r}
+# Load precomputed results
+load(file="Results/FoodGroupsKcal_DMM_Boot50.Rdata")
+```
+
+The graphic below confirms our first choice of K=5 components (or diet patterns).
+
+```{r}
+# Format data to plot
+data_stab2 <- data.frame(Nb_Comp = rep(names(res_boot2), sapply(res_boot2, length)),
+                 Stability = unlist(res_boot2))
+data_stab2$Nb_Comp <- factor(as.numeric(data_stab2$Nb_Comp))
+```
+
+```{r echo=FALSE}
+# Plot
+ggplot(data=data_stab2, aes(x=Nb_Comp, y=Stability)) +
+  geom_boxplot() +
+  geom_hline(yintercept=0.6, color="red", lwd=1) +
+  geom_text(aes(0, 0.6), label=0.6, vjust=-0.5, hjust=-0.5, color="red") +
+  ggtitle("Stability criteria - 50 bootstrap samples") +
+  scale_x_discrete(name="Number of components") +
+  scale_y_continuous(name="Mean stability by component", limits=c(0,1)) +
+  theme(plot.title = element_text(size=17, face="bold", hjust=0.5),
+        axis.title = element_text(size=15),
+        axis.text.x = element_text(size=12, margin = margin(t = 2, r = 0, b = 5, l = 0)),
+        axis.text.y = element_text(size=12, margin = margin(t = 0, r = 2, b = 0, l = 5)))
+```
+
+## Dietary patterns definition (core and non core)
+
+We then define dietary patterns for each participant. We determine both core patterns defined as participants having a probability above 0.8 to belong to their pattern (DP5_FoodGroups, used in the associated paper and in this document) and non core patterns ie. the full patterns (DP5_FoodGroups_NC, given for information purposes).
+
+```{r}
+# Getting assigned pattern for each participant
+res_dmn5 <- fit_list[[5]]
+groups_dmn5 <- mixture(res_dmn5,assign = TRUE)
+patterns_results <- data.frame("survey_id" = names(groups_dmn5), "DP5_FoodGroups_NC"=paste0("P",groups_dmn5), stringsAsFactors = TRUE)
+# Getting probability of assignment
+proba_dmn5 <- mixture(res_dmn5)
+colnames(proba_dmn5) <- paste0("P",1:5)
+patterns_results <- merge(patterns_results,proba_dmn5,by.x="survey_id",by.y="row.names")
+
+# Keep assignment only of if "Core" pattern (p>=0.8)
+patterns_results$DP5_FoodGroups <- patterns_results$DP5_FoodGroups_NC
+for (i in 1:5) {
+  patterns_results[patterns_results$DP5_FoodGroups_NC==glue("P{i}") & patterns_results[,glue("P{i}")]<0.8,"DP5_FoodGroups"] <- NA
+}
+patterns_results <- patterns_results[,c("survey_id", "DP5_FoodGroups_NC", "DP5_FoodGroups")]
+
+# Put the same names and order as in the associated paper
+for (var in c("DP5_FoodGroups_NC","DP5_FoodGroups")) {
+  patterns_results[,var] <- c("HW","FL","ED","SW","PB")[patterns_results[,var]]
+  patterns_results[,var] <- factor(patterns_results[,var], levels=c("PB","FL","HW","SW","ED"))
+}
+```
+
+We obtain the following distribution by dietary pattern using the names from the associated publication (PB: Plant-Based, FL: Flexitarian, HW: Health-Conscious Western, SW: Standard Western, ED: Exclusion Diet).
+
+```{r echo=FALSE, message=FALSE}
+# Output the number of participants by pattern
+part1 <- patterns_results %>% group_by(DP5_FoodGroups) %>%
+  summarise(DP5_N=n()) %>%
+  as.data.frame()
+part2 <- patterns_results %>% group_by(DP5_FoodGroups_NC) %>%
+  summarise(DP5_NC_N=n()) %>%
+  as.data.frame()
+res_summary <- merge(part1,part2,by.x="DP5_FoodGroups",by.y="DP5_FoodGroups_NC")
+rownames(res_summary) <- res_summary[,1]
+colnames(res_summary) <- c("patterns","DP5_FoodGroups","DP5_FoodGroups_NC")
+res_summary <- res_summary[c("PB","FL","HW","SW","ED"),]
+res_summary <- t(as.matrix(res_summary[,-1]))
+res_summary %>% datatable(filter="none", options=list(pageLength=nrow(res_summary), dom="t"))
+```
+
+
+# Characterizing the DP5 dietary patterns
+
+The second step will be to characterize these DP5 patterns vs. the food groups that were used to build them and vs. other metadata.
+
+## Food groups contribution to DMM results
+
+We will first look at the contribution of each food group to the 5 diet patterns definition in the following graphic. Food groups are ordered from the one which contributes the most to the clustering to the one which contributes the less. Only the top 20 food groups are detailed.
+
+```{r}
+# Initialization
+nkeep <- 20 # Number of food groups to keep
+
+# Scales food groups contributions for 1 or 5 components
+p1 <- fitted(fit_list[[1]], scale=TRUE)
+pN <- fitted(fit_list[[5]], scale=TRUE)
+p1 <- p1[rownames(pN), , drop = FALSE]
+colnames(pN) <- c("HW","FL","ED","SW","PB")
+
+# Order by food groups contribution
+diff <- rowSums(abs(pN - as.vector(p1)))
+o <- order(diff, decreasing=TRUE)
+pN_sorted <- pN[o,]
+
+# Focus on the first nkeep food groups and group the other in an "Other" category 
+pN_other <- colSums(pN_sorted[(nkeep+1):nrow(pN_sorted),])
+df <- rbind(pN_sorted[1:nkeep,],pN_other)
+rownames(df)[nrow(df)] <- "Other"
+
+# Data to plot
+data_plot <- df %>% as.data.frame(stringsAsFactors = TRUE) %>%
+  tibble::rownames_to_column("FoodGroups") %>%
+  as_tibble %>%
+  reshape2::melt(id.vars="FoodGroups") %>%
+  mutate(FoodGroups = factor(FoodGroups, levels = rownames(df))) %>% 
+  group_by(variable) %>%
+  mutate(ymax=cumsum(value)) %>%
+  mutate(ymin=c(0, head(ymax, n=-1)))
+data_plot$variable <- factor(data_plot$variable, levels=c("PB","FL","ED","HW","SW"))
+```
+
+
+```{r echo=FALSE}
+# Plot
+# Color code
+set.seed(123456)
+my_cols <- c(sample(c(RColorBrewer::brewer.pal("Paired",n=12),RColorBrewer::brewer.pal("Pastel2",n=8)),size=nkeep,replace=FALSE),alpha("gray",0.2))
+names(my_cols) <- rownames(df)[c(13,12,5,14,10,4,17,2,19,6,20,7,9,15,11,8,1,18,3,16,21)] # To reproduce the color code of the associated paper
+# Graphic
+ggplot(data_plot,aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=FoodGroups)) + 
+  geom_rect() +      
+  coord_polar(theta="y") + 
+  facet_wrap(~variable) + 
+  xlim(c(2, 4)) + theme_void() +
+  scale_fill_manual(values=my_cols) +
+  ggtitle("DMM scaled contributions") +
+  theme(legend.title = element_text(size = 10, face="bold"), 
+        legend.text = element_text(size = 6),
+        strip.text.x = element_text(face = "bold"),
+        plot.title = element_text(size=15, face="bold", hjust = 0.5, margin=margin(10,0,20,0)))
+```
+
+We can also check how the 5 diet patterns are related to one another with a hierarchical ascending classification (HAC) based on the standardized contributions of each food group. We can for example see that PB and FL patterns, which both consume less meat (cf. graphic above) are close to each other.
+
+```{r}
+# Prepare data (DMM contributions) - standardized
+DMM_contrib <- fitted(fit_list[[5]], scale=TRUE)
+DMM_contrib <- scale(DMM_contrib, center=TRUE, scale=TRUE)
+colnames(DMM_contrib) <- c("HW","FL","ED","SW","PB")
+dist_clust <- dist(t(DMM_contrib),method="euclidean")
+# HAC and plot
+mod_hac <- hclust(dist_clust, method="ward.D2")
+dend <- as.dendrogram(mod_hac)
+```
+
+```{r echo=FALSE}
+# Change tips order (just rotate groups) and plot
+dend <- dendextend:::rotate(dend,c("PB","FL","HW","SW","ED"))
+plot(dend,cex=10)
+```
+
+We will then try to understand the differences between branches of our HAC analysis. A food group appears in the table below if its DMM contribution is higher/lower in all left patterns vs. right patterns and if its Cliff’s Delta effect size is at least medium (absolute value above 0.33). Cliff’s Delta effect sizes were computed based on individual relative kcal intake.
+
+```{r}
+# Prepare relative data per 1000 kCal
+data_rel <- t(apply(FoodGroupsdata,MARGIN=1,function(x){1000*x/sum(x)}))
+data_rel <- merge(patterns_results[,c("survey_id","DP5_FoodGroups")],data_rel,by.x="survey_id",by.y="row.names")
+
+# Prepare DMM contribution data
+DMM_contrib <- fitted(fit_list[[5]], scale=TRUE)
+colnames(DMM_contrib) <- c("HW","FL","ED","SW","PB")
+  
+# Groups to compare
+groups_list <- list(list("L"=c("PB","FL"),"R"=c("HW","SW","ED")),
+                               list("L"=c("PB"),"R"=c("FL")),
+                               list("L"=c("HW","SW"),"R"=c("ED")),
+                               list("L"=c("HW"),"R"=c("SW")))
+
+for (i in 1:length(groups_list)) {
+  groups <- groups_list[[i]]
+  # Get variables that have DMM contribution strictly higher in one group (L or R)
+  var_keep <- rownames(DMM_contrib)[rowMins(DMM_contrib[,groups[["R"]],drop=FALSE]) >
+                                      rowMaxs(DMM_contrib[,groups[["L"]],drop=FALSE]) |
+                                      rowMaxs(DMM_contrib[,groups[["R"]],drop=FALSE]) <
+                                      rowMins(DMM_contrib[,groups[["L"]],drop=FALSE])]
+  # Among these variables, compute effect size (based on individual relative abundances)
+  # between L and R.
+  # For Cliff's Delta absolute value you have a small effect size  around .147, a medium
+  # effect size around .33, and a large effect size around .474.
+  # Create temporary vector with clusters L vs clusters R
+  new_clust <- data_rel[,"DP5_FoodGroups"]
+  levels(new_clust) <- c(levels(new_clust),"R","L")
+  new_clust[new_clust %in% groups[["R"]]] <- "R"
+  new_clust[new_clust %in% groups[["L"]]] <- "L"
+  new_clust <- factor(new_clust,levels=c("L","R"))
+  # Loop on variables
+  effect_size <- vector(length=length(var_keep),mode="numeric")
+  names(effect_size) <- var_keep
+  for (var in var_keep) {
+    effect_size[var] <- round(cliff.delta(data_rel[,var]~new_clust)$estimate,3)
+  }
+  effect_size <- data.frame(effect_size, stringsAsFactors = TRUE)
+  effect_size$var <- rownames(effect_size)
+  # Keep only at least medium effect sizes
+  effect_size <- effect_size[abs(effect_size$effect_size)>=0.33,]
+  colnames(effect_size)[1] <- paste(paste(groups[["L"]],collapse="_"),
+                                    paste(groups[["R"]],collapse="_"),sep=" vs ")
+  # Create or increment effect size dataset
+  if (i==1) {
+    effect_sizes <- effect_size
+  } else {
+    effect_sizes <- merge(effect_sizes,effect_size,by="var",all=TRUE)
+  }
+  
+}
+```
+
+
+```{r echo=FALSE}
+# Print table
+effect_sizes %>% datatable(rownames=FALSE, options=list(searching=FALSE)) %>%
+  formatRound(columns=2:(length(groups_list)+1), digits=3)
+```
+
+
+## Characterization vs. metadata
+
+Finally, we will characterize our DP5 patterns vs metadata (ie. questions from the general AGP questionnaire and other VioScreen^TM^ information). We will use the compareGroups package with Kruskal-Wallis tests to compare quantitative variables between patterns and Chi-squared tests for qualitative variables.
+
+```{r echo=FALSE}
+# Order some factors in metadata (not logical order, just to facilitate table output)
+var_freq_vec <- c("ONE_LITER_OF_WATER_A_DAY_FREQUENCY","FRUIT_FREQUENCY","RED_MEAT_FREQUENCY",
+                  "MEAT_EGGS_FREQUENCY","MILK_CHEESE_FREQUENCY","SEAFOOD_FREQUENCY",
+                  "SUGARY_SWEETS_FREQUENCY","SUGAR_SWEETENED_DRINK_FREQUENCY","VEGETABLE_FREQUENCY",
+                  "WHOLE_GRAIN_FREQUENCY","EXERCISE_FREQUENCY","SMOKING_FREQUENCY",
+                  "ALCOHOL_FREQUENCY","PROBIOTIC_FREQUENCY","HOMECOOKED_MEALS_FREQUENCY",
+                  "READY_TO_EAT_MEALS_FREQUENCY","MILK_SUBSTITUTE_FREQUENCY","OLIVE_OIL")
+for (var in var_freq_vec) {
+  metadata[,var] <- factor(metadata[,var],levels=c("Rarely","Occasionally","Regularly"))
+}
+metadata$ANTIBIOTIC_HISTORY <- factor(metadata$ANTIBIOTIC_HISTORY,
+                                      levels=c("Less than 1 year","More than 1 year","Less than 6 months"))
+metadata$BOWEL_MOVEMENT_QUALITY <- factor(metadata$BOWEL_MOVEMENT_QUALITY,
+                                          levels=c("Constipated (1-2)","Diarrhea (5-7)","Normal (3-4)"))
+metadata$TYPES_OF_PLANTS <- factor(metadata$TYPES_OF_PLANTS,
+                                   levels=c("Less than 10","11 to 20","More than 20"))
+metadata$DIET_TYPE <- factor(metadata$DIET_TYPE,
+                             levels=c("Intermediate pattern","Omnivore","Vegetarian"))
+```
+
+
+```{r}
+# Merge metadata and pattern information - remove non core patterns
+metadata_part <- merge(patterns_results[,c("survey_id","DP5_FoodGroups")], metadata, by="survey_id")
+metadata_part2 <- metadata_part[!is.na(metadata_part$DP5_FoodGroups),]
+
+# Characterization by pattern
+set.seed(21091981)
+form <- as.formula(paste("DP5_FoodGroups",paste(names(metadata_part2)[-c(1:2)],collapse=" + "),sep=" ~ "))
+
+# Descriptive statistics and tests (Kruskal-Wallis for Quantitative variables
+# and Chisquare for qualitative ones)
+# BH adjustment for 2 by 2 comparisons
+res <- compareGroups(form, data=metadata_part2, method=2, chisq.test.perm=TRUE, p.corrected=TRUE)
+# Get post-hoc results
+post_hoc <- getResults(res, what = "p.mul")
+# Get adjusted overall p-values
+pvals <- getResults(res, "p.overall")
+pvals_adj <- as.data.frame(p.adjust(pvals, method = "BH"), stringsAsFactors = TRUE)
+names(pvals_adj) <- "adj. p-value"
+
+# Compute compact letter display
+tab <- post_hoc
+colnames(tab) <- gsub(" vs ","-",gsub("p.","",colnames(tab)))
+completters <- vector(mode="character",length=nrow(tab))
+names(completters) <- rownames(tab)
+for (i in 1:nrow(tab)) {
+  comp <- multcompLetters(tab[i,])$Letters
+  completters[i] <- paste(apply(rbind(names(comp),comp),MARGIN=2,paste,collapse="-"),collapse=" ")
+}
+completters <- data.frame(completters)
+```
+
+
+```{r echo=FALSE}
+# Format adjusted p-values
+pvals_adj_format <- pvals_adj
+pvals_adj_format[,1] <- as.character(pvals_adj_format[,1])
+pvals_adj_format[pvals_adj[,1]<0.001,1] <- "<0.001"
+pvals_adj_format[pvals_adj[,1]>=0.001,1] <- sprintf("%.3f", round(pvals_adj[pvals_adj[,1]>=0.001,1],3))
+
+# Get list of modalities to hide from final table
+# Note: We remove more than 1 modality by factor for readability reasons,
+# it is not recommended to do that in order to interpret all results
+hide_list_part1 <- list("SEX" = 'male',
+                        "LEVEL_OF_EDUCATION" = 'NON_GRADUATE',
+                        "ANTIBIOTIC_HISTORY"= c("Less than 1 year","More than 1 year"),
+                        "BOWEL_MOVEMENT_QUALITY"=c("Constipated (1-2)","Diarrhea (5-7)"),
+                        "TYPES_OF_PLANTS" = c('Less than 10','11 to 20'),
+                        "DIET_TYPE" = c('Intermediate pattern','Omnivore'))
+hide_list_part2 <- vector("list", length(var_freq_vec))
+names(hide_list_part2) <- var_freq_vec
+for (var in var_freq_vec) {
+  hide_list_part2[[var]] <- c("Rarely","Occasionally")
+}
+hide_list <- c(hide_list_part1, hide_list_part2)
+
+# Put adjusted p-value instead of raw p-value
+# Note: the function is not designed to remove more than 1 modality per group, however it works as 
+# long as the modalities to remove are in first positions in the result object
+res_charac <- createTable(res, show.p.overall = TRUE, hide.no = "No", hide=hide_list)
+res_charac_descr <- res_charac$descr
+res_charac_descr[,"p.overall"] <- pvals_adj_format[,1]
+# Add completters to the output table
+add_col <- matrix(NA,ncol=1,nrow=nrow(res_charac_descr))
+colnames(add_col) <- "completters"
+res_charac_descr <- cbind(res_charac_descr,add_col)
+res_charac_descr[,"completters"] <- completters[,1]
+# Remove completters results if overall adjusted p-value is not significant
+# Note: we only check the values that were not formatted to "<0.001"
+range_col <- c((which(colnames(res_charac_descr)=="p.overall")+1):ncol(res_charac_descr))
+res_charac_descr[which(as.numeric((res_charac_descr[,"p.overall"]))>0.05),range_col] <- NA
+colnames(res_charac_descr)[which(colnames(res_charac_descr)=="p.overall")] <- "adjusted p-value"
+res_charac$descr <- res_charac_descr
+
+# Print result
+res_charac_descr %>% datatable(caption="Data are presented as median [IQR] for quantitative variables and as N (%) for qualitative variables. For readability reasons, only one representative modality is printed for multi-modal factors. patterns with the same letter are not significantly different (p-value<0.05).")
+```
+
+
+# Associations with 16S gut microbiome
+
+The last step will be to see how these DP5 diet patterns associate with 16S gut microbiome data.
+
+## Preparing metadata
+
+Let's first prepare the metadata that will be used for all microbiome analyses.
+
+```{r}
+# Define confouding factors and associated formula
+conf <- c("AGE_SAMPLE","SEX","BMI")
+conf_sum <- paste(conf,collapse="+")
+
+# Merge patterns, metadata and sample ID to metadata_temp,
+# remove missing values for core patterns
+CorrespSamples <- na.omit(CorrespSamples)
+metadata_744 <- merge(CorrespSamples[,c("survey_id","sample_id_microbiome")],
+                               merge(patterns_results,
+                                     metadata[,c("survey_id",conf)],
+                                     by="survey_id"),
+                               by="survey_id")
+names(metadata_744)[which(names(metadata_744)=="sample_id_microbiome")] <- "SAMPLE_NAME" #Homogeneize name with other files
+```
+
+
+## Alpha-diversity
+
+We will then look for associations between the DP5 patterns and 5 alpha diversity indices:
+
+* the number of observed OTUs
+* Chao1
+* Shannon's entropy
+* Simpson's H
+* Faith's phylogenetic diversity
+
+We used Kruskal-Wallis tests on diversity indices adjusted for age, sex and BMI (i.e. residuals of a linear model with age, sex and BMI).
+
+```{r}
+# Initializations
+alpha_res_glob <- matrix(NA, ncol=2+10, nrow=5)
+colnames(alpha_res_glob) <- 1:ncol(alpha_res_glob)
+colnames(alpha_res_glob)[1:2] <- c("pval","adj_pval")
+rownames(alpha_res_glob) <- colnames(alpha)[-1]
+completters <- matrix("",ncol=5,nrow=ncol(alpha)-1)
+rownames(completters) <- names(alpha)[-1]
+colnames(completters) <- c("HW","FL","ED","SW","PB")
+pl_resid <- list()
+
+data.to.analyze <- merge(alpha, metadata_744, by="SAMPLE_NAME")
+
+# Loop over alpha diversity indices
+for (k in 2:ncol(alpha)) {
+  
+  alpha_ind <- names(alpha)[k]
+  
+  # Linear model on confounding factors
+  res.alpha <- lm(as.formula(paste0(alpha_ind, "~ ",paste(conf,collapse="+"))),
+                  data=data.to.analyze)  
+  # Kruskal-Wallis test on residuals
+  res.kruskal <- kruskal.test(x = resid(res.alpha), g = data.to.analyze$DP5_FoodGroups)
+  alpha_res_glob[k-1,"pval"] = res.kruskal$p.value
+  
+  # Post-hoc adjustment and formatting for all indices
+  post_hoc_test <- pairwise.wilcox.test(resid(res.alpha), 
+                     data.to.analyze$DP5_FoodGroups, 
+                     p.adjust.method="BH")$p.value
+  post_hoc_pval <- as.vector(post_hoc_test)
+  names(post_hoc_pval) <- unlist(lapply(colnames(post_hoc_test),
+                                        FUN=function(x) {paste(rownames(post_hoc_test),x,sep="-")}))
+  post_hoc_pval <- post_hoc_pval[!is.na(post_hoc_pval)]
+  alpha_res_glob[k-1,3:ncol(alpha_res_glob)] <- post_hoc_pval
+  
+  if (k==2) {
+    colnames(alpha_res_glob)[3:ncol(alpha_res_glob)] <- names(post_hoc_pval)
+  }
+  
+  # Compute completters for ulterior plotting
+  completters[k-1,] <- multcompLetters(post_hoc_pval)$Letters[colnames(completters)]
+  
+  # Prepare first part of data frame for plotting
+  data.to.plot <- cbind.data.frame(data.to.analyze, resid=resid(res.alpha))
+  data.to.plot[,"resid_centered"] <- mean(data.to.plot[,alpha_ind]) + data.to.plot[,"resid"]
+  data.to.plot <- data.to.plot[!is.na(data.to.plot[,"DP5_FoodGroups"]),]
+  data.to.plot[,"DP5_FoodGroups"] = droplevels(data.to.plot[,"DP5_FoodGroups"])
+  data.to.plot <- data.to.plot[,c("survey_id","DP5_FoodGroups","resid_centered")]
+  data.to.plot$alpha_ind <- rep(alpha_ind,nrow(data.to.plot))
+  
+  if(k==2) {
+    part1 <- data.to.plot
+  } else {
+    part1 <- rbind(part1,data.to.plot)
+  }
+
+}
+
+# FDR adjustment for the 5 indices
+alpha_res_glob[,"adj_pval"] <- p.adjust(alpha_res_glob[,"pval"], method="BH")
+
+# Remove post-hoc results if global effect is NS
+alpha_res_glob[alpha_res_glob[,"adj_pval"]>=0.05,3:ncol(alpha_res_glob)] <- NA
+```
+
+
+There were significant associations only for `r sum(alpha_res_glob[,"adj_pval"]<0.05)` indices and they are plotted below. Dietary patterns with the same letter are not significantly different (p-value<0.05).
+
+```{r echo=FALSE}
+# Compact letter display
+part2 <- data.frame(completters)
+part2$alpha_ind <- rownames(part2)
+part2 <- melt(part2, id.vars = "alpha_ind", variable.name="DP5_FoodGroups", value.name="completters")
+# Add y position
+temp <- part1 %>% group_by(alpha_ind,DP5_FoodGroups) %>%
+  summarise(Y=quantile(resid_centered,prob=0.75)) %>%
+  as.data.frame()
+part2 <- merge(part2,temp,by=c("alpha_ind","DP5_FoodGroups"))
+  
+# Keep only indices with significant adjusted p-value
+signif_ind <- rownames(alpha_res_glob[alpha_res_glob[,"adj_pval"]<0.05,])
+part1 <- part1[part1$alpha_ind %in% signif_ind,]
+part1$DP5_FoodGroups <- factor(part1$DP5_FoodGroups, levels=c("PB","FL","HW","SW","ED"))
+part2 <- part2[part2$alpha_ind %in% signif_ind,]
+part2$DP5_FoodGroups <- factor(part2$DP5_FoodGroups, levels=c("PB","FL","HW","SW","ED"))
+
+# Plot
+ggplot(data=part1, aes(x=DP5_FoodGroups, y=resid_centered)) +
+  geom_boxplot() +
+  facet_wrap(~ alpha_ind, scales="free_y") +
+  geom_text(data=part2, aes(label=completters, y=Y), vjust=-0.2, hjust=1.1, fontface=2) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text=element_text(hjust=0.5, face="bold"))
+```
+
+
+## Beta-diversity
+
+Using partial distance-based redundancy analysis (db-RDA), we also associated the DP5 diet patterns with 4 beta diversity indices:
+
+* Bray-Curtis dissimilarity
+* unweighted Unifrac distance
+* weighted Unifrad distance
+* Aitchison distance
+
+The models take into account age, sex and bmi as confounding factors.
+
+```{r eval=FALSE}
+# (Not run - Too long - Should be parallelized)
+# Global parameters
+perm=9999
+num_cores <- 1 # To change if parallelization is used
+metadata_temp <- na.omit(metadata_744)
+
+# Apply a sqrt transformation on bc and wUni
+for (d in c("bc","wUni")) {
+  temp <- as.matrix(beta[[d]])
+  temp <- sqrt(temp)
+  beta[[d]] <- as.dist(temp)
+}
+
+# Formula for confoundings
+form <- as.formula(glue("beta_dist ~ DP5_FoodGroups + Condition({conf_sum})"))
+
+# Initializations
+pdbRDA_res_tab <- matrix(0,nrow=length(beta),ncol=3)
+colnames(pdbRDA_res_tab) <- c("var_percent","pval","adj_pval")
+pdbRDA_res_tab <- data.frame("beta_ind"=names(beta),pdbRDA_res_tab)
+betadisper_res_tab <- pdbRDA_res_tab[,-2]
+
+# Loop over beta diversity indices
+for (k in 1:length(beta)) {
+  
+  beta_dist <- beta[[k]]
+  
+  # Reorder beta_dist and keep only the right samples
+  beta_temp <- as.matrix(beta_dist)
+  beta_temp <- beta_temp[as.character(metadata_temp$SAMPLE_NAME),
+                         as.character(metadata_temp$SAMPLE_NAME)]
+  beta_dist <- as.dist(beta_temp)
+
+  # Partial db-RDA test
+  pdbRDA_mod <- capscale(form, data=metadata_temp, add=TRUE)
+  set.seed(123456)
+  pdbRDA_test <- anova(pdbRDA_mod, by="terms", permutations=perm,
+                       model="reduced", parallel=num_cores)
+  pdbRDA_sum <- summary(pdbRDA_mod)
+  pdbRDA_res_tab[k,"var_percent"] <- 100*pdbRDA_sum$constr.chi/pdbRDA_sum$tot.chi
+  pdbRDA_res_tab[k,"pval"] <- pdbRDA_test$`Pr(>F)`[1]
+  
+  # Beta-disper test
+  betadisper_mod <- betadisper(beta_dist, metadata_temp$DP5_FoodGroups)
+  set.seed(123456)
+  betadisper_test <- permutest(betadisper_mod, pairwise = TRUE,
+                               permutations=perm, parallel=num_cores)
+  betadisper_res_tab[k,"pval"] <- betadisper_test$tab$`Pr(>F)`[1]
+  
+}
+
+# FDR adjustment for the multiple beta indices
+pdbRDA_res_tab$adj_pval <- p.adjust(pdbRDA_res_tab$pval, method="BH")
+betadisper_res_tab$adj_pval <- p.adjust(betadisper_res_tab$pval, method="BH")
+```
+
+```{r}
+# Load precomputed results
+load(file="Results/DMMvsBeta_Results.RData")
+```
+
+None of the beta dispersion tests was significant, we will thus be able to interpret the partial db-RDA results.
+
+```{r echo=FALSE}
+# Put nice beta div names
+nice_names <- c("Bray-Curtis","unweighted Unifrac", "weighted Unifrac", "Aitchison")
+names(nice_names) <- c("bc","uUni","wUni","ait")
+betadisper_res_tab$beta_ind <- nice_names[as.character(betadisper_res_tab$beta_ind)]
+# Print table of betadisper results
+betadisper_res_tab %>% datatable(rownames=FALSE, filter="none",
+                                 colnames=c("beta diversity index","p-value","adjusted p-value"),
+                                 options=list(pageLength=nrow(betadisper_res_tab),
+                                              columnDefs = list(list(className = 'dt-center', targets = 0)),
+                                              dom="t")) %>%
+  formatRound(columns=2:ncol(betadisper_res_tab), digits=4)
+```
+
+All partial db-RDA tests were significant. The DP5 patterns were thus significantly associated with all 4 beta diversity indices.
+
+```{r echo=FALSE}
+# Put nice beta div names
+pdbRDA_res_tab$beta_ind <- nice_names[as.character(pdbRDA_res_tab$beta_ind)]
+# Print table of partial dbRDA results
+pdbRDA_res_tab %>% datatable(rownames=FALSE, filter="none",
+                             colnames=c("beta diversity index","percentage of variance","p-value","adjusted p-value"),
+                             options=list(pageLength=nrow(pdbRDA_res_tab),
+                                          columnDefs = list(list(className = 'dt-center', targets = 0)),
+                                          dom="t")) %>%
+  formatRound(columns=3:ncol(pdbRDA_res_tab), digits=4) %>%
+  formatRound(columns=2, digits=2)
+```
+
+
+## Genera - DESeq2 analysis
+
+Finally we looked at associations with specific genera using the DESeq2 package and adjusting for age, sex and BMI. We use Likelihood ratio tests (LRT) for the global diet patterns effect (with Benjamini-Hochberg adjustment for multiple testing). Then, we use Wald tests for 2 by 2 comparisons. These comparisons are also adjusted for multiple testing, but for each genus independently.
+
+```{r eval=FALSE}
+# (Not run - A little long)
+# Add sample data in the phyloseq object
+sam_data <- metadata_744
+sam_data <- sam_data[order(match(sam_data$SAMPLE_NAME,colnames(otu_table(genera_filter)))),]
+rownames(sam_data) <- sam_data$SAMPLE_NAME
+sam_data$DP5_FoodGroups <- factor(sam_data$DP5_FoodGroups, levels=c("PB","FL","HW","SW","ED"))
+sample_data(genera_filter) <- sam_data
+
+# Get size factors
+# Create a DESeq2 temp object
+dds_temp = phyloseq_to_deseq2(genera_filter, ~ 1)
+# Size factors estimated with filtered genera - all samples - poscounts
+dds_temp <- estimateSizeFactors(dds_temp, type="poscounts")
+sizefactors_filter <- sizeFactors(dds_temp)
+
+# Remove NA values for the core pattern and create DESeq2 object
+genera_temp <- prune_samples(!is.na(sample_data(genera_filter)[["DP5_FoodGroups"]]), genera_filter)
+dds <- phyloseq_to_deseq2(genera_temp, ~ 1)
+samp_keep <- sample_names(genera_temp)
+
+# Add size factors and design
+design(dds) <- as.formula(glue("~ {conf_sum} + DP5_FoodGroups"))
+sizeFactors(dds) <- sizefactors_filter[samp_keep]
+
+# Global pattern effect (using precomputed size factors)
+dds_res1 <- DESeq(dds, test="LRT", reduced= as.formula(glue("~ {conf_sum}")))
+res_glob <- results(dds_res1, alpha=0.05)
+# Get list of significant genera (global effect)
+signif_genera <- rownames(res_glob[which(res_glob$padj<0.05),])
+
+# Post-hoc comparisons
+dds_res2 <- DESeq(dds, test="Wald")
+co = matrix(as.character(combn(levels(data.frame(sample_data(genera_temp))[,"DP5_FoodGroups"]),2)),nrow=2) # Generate pairs of groups
+output_FDR <- matrix(0,ncol=ncol(co),nrow=length(signif_genera))
+rownames(output_FDR) <- signif_genera
+colnames(output_FDR) <- apply(co,MARGIN=2,paste,collapse="-")
+output_LogFC <- output_FDR
+for(elem in 1:ncol(co)){ # Loop on comparisons
+  # Perform contrast
+  res_onecomp <- results(dds_res2, contrast=c("DP5_FoodGroups",glue("{co[1,elem]}"),glue("{co[2,elem]}")) , alpha=0.05)
+  # Extract unadjusted pvalue of genera with significant global effect, and adjust it with BH
+  output_FDR[,elem] <- p.adjust(res_onecomp[signif_genera,"pvalue"],method="BH")
+  output_LogFC[,elem] <- res_onecomp[signif_genera,"log2FoldChange"]
+}
+
+# Extract log2FC for each group to plot them
+dds2 <- dds
+design(dds2) <- as.formula(glue("~ -1 + DP5_FoodGroups + {conf_sum}"))
+dds_res3 <- DESeq(dds2, test="Wald")
+groups <- levels(colData(dds_res2)[,"DP5_FoodGroups"])
+order_LogFC <- matrix(0,ncol=length(groups),nrow=length(signif_genera))
+rownames(order_LogFC) <- signif_genera
+colnames(order_LogFC) <- groups
+order_lfcSE <- order_LogFC
+for (group in groups) {
+  res_temp <- results(dds_res3, name = paste0("DP5_FoodGroups",group))
+  order_LogFC[,group] <- res_temp[signif_genera,"log2FoldChange"]
+  order_lfcSE[,group] <- res_temp[signif_genera,"lfcSE"]
+}
+```
+
+```{r}
+# Load precomputed results
+load(file="Results/DMMvsGenera_Results.RData")
+```
+
+The heatmap below shows results for all 2 by 2 comparisons.
+
+```{r echo=FALSE}
+# Heatmap of post-hoc results with fold change and adjusted pvalues for all comparisons
+# Order by normalized abundances (need a DESeq2 object on the global dataset)
+data_logFC <- output_LogFC
+select1 <- rownames(data_logFC)[order(rowMeans(counts(dds_temp,normalized=TRUE))[rownames(data_logFC)],
+                                      decreasing=FALSE)]
+data_logFC <- data_logFC[select1,]
+
+# log2FC
+melted_data_logFC <- melt(data_logFC)
+
+colnames(melted_data_logFC)[3] <- "Log2FC"
+
+# -log10(FDR)
+data_adj_pval <- -log10(output_FDR)
+melted_data_adj_pval <- melt(data_adj_pval)
+melted_data_adj_pval$color <- 0
+
+melted_data_adj_pval$color[melted_data_adj_pval$value <= -log10(0.1)] <- "NS"
+melted_data_adj_pval$color[melted_data_adj_pval$value > -log10(0.1) & melted_data_adj_pval$value <= -log10(0.05)] <- "Trend"
+melted_data_adj_pval$color[melted_data_adj_pval$value > -log10(0.05)] <- "Signif"
+melted_data_adj_pval$color = factor(melted_data_adj_pval$color, levels = c("NS","Trend","Signif"))
+
+# Data to plot with the right order
+complete_data <- merge(melted_data_logFC, melted_data_adj_pval, by=c("Var1","Var2"))
+complete_data$Var2 <- factor(complete_data$Var2, levels=c("PB-ED","FL-ED","HW-ED","SW-ED","PB-FL",
+                                                          "HW-SW","FL-SW","PB-SW","FL-HW","PB-HW"))
+
+colors_dots <- c('#f7f7f7','#969696','#252525')
+names(colors_dots) <- c("NS","Trend","Signif")
+
+ggplot(data = complete_data, aes(x=Var2, y=Var1, fill=Log2FC)) + 
+  geom_tile(color="white") +
+  scale_fill_distiller(direction = -1, palette = "RdBu", limits=c(-4.2,4.2), name="Effect size\nLog2FC") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+        axis.text.y = element_text(size=10),
+        axis.title = element_blank(),
+        plot.title=element_text(hjust=0.5, face="bold", size=15),
+        plot.margin = unit(c(10,0,0,0), "pt")) +
+  coord_fixed() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  geom_point(aes(size=value, color=color)) +
+  labs(size = "Evidence\n-log10(p-value)", color="Significance") +
+  scale_color_manual(values=colors_dots) +
+  scale_size(limits=c(0,10),breaks=c(2,4,6,8),range=c(1,4))
+```
+
+A few genera with significant results are shown below. Log2 fold change +/- standard error as estimated by a DESeq2 model with no intercept are plotted. Groups with the same letter are not significantly different (p-value<0.05).
+
+```{r echo=FALSE}
+# Barplots for a selected list of genera
+# Define the list of genera
+genera_to_plot <- c("BactActiActi_g_Bifidobacterium","BactTeneMoll_o_RF39_g_NA",
+                    "BactFirmClos_g_Oribacterium","BactBactBact_g_Parabacteroides")
+nice_names <- c("Bifidobacterium","Genus in RF39 order","Oribacterium","Parabacteroides")
+names(nice_names) <- genera_to_plot
+
+# Create compact letter display for each taxa
+completters <- matrix("",ncol=length(genera_to_plot),nrow=5)
+colnames(completters) <- genera_to_plot
+rownames(completters) <- c("HW","FL","ED","SW","PB")
+for (g in genera_to_plot) {
+  order_vec <- names(sort(order_LogFC[g,]))
+  comp <- multcompLetters(output_FDR[g,])$Letters[order_vec]
+  completters[,g] <- comp[rownames(completters)]
+}
+completters <- data.frame(completters)
+
+# Prepare data
+# Log2FC
+part1 <- data.frame(order_LogFC)
+part1$genus <- rownames(part1)
+part1 <- melt(part1, id.vars = "genus", variable.name="DP5_FoodGroups", value.name="Log2FC")
+# lfcSE
+part2 <- data.frame(order_lfcSE)
+part2$genus <- rownames(part2)
+part2 <- melt(part2, id.vars = "genus", variable.name="DP5_FoodGroups", value.name="lfcSE")
+# completters
+part3 <- data.frame(t(completters))
+part3$genus <- rownames(part3)
+part3 <- melt(part3, id.vars = "genus", variable.name="DP5_FoodGroups", value.name="completters")
+# Final data
+data_plot <- merge(merge(part1,part2,by=c("genus","DP5_FoodGroups")),
+                   part3,by=c("genus","DP5_FoodGroups"))
+data_plot$nice_name <- factor(nice_names[data_plot$genus],levels=nice_names)
+
+# Plot
+ggplot(data=data_plot, aes(x=DP5_FoodGroups, y=Log2FC)) +
+  geom_bar(stat="identity", color="black", fill="white", position=position_dodge()) +
+  geom_errorbar(aes(ymin=Log2FC-lfcSE, ymax=Log2FC+lfcSE), width=.2, position=position_dodge(.9)) +
+  scale_y_continuous(name="Log2FC +/- SE", limits=c(0,10.5)) +
+  geom_text(aes(label=completters, y=Log2FC+lfcSE), vjust=-0.5, fontface=2) +
+  facet_wrap(~nice_name) +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text=element_text(hjust=0.5, face="bold"))
+```
+
