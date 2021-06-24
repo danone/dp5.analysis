@@ -10,7 +10,7 @@ Load all directories keeping the same organization and just run the .Rmd file af
 Thank you to Mathilde Saccareau and Julien Tap (https://github.com/tapj) for their contributions.
 
 ## Licence
-GNU GPL-3
+The code is under GNU GPL-3
 
 ## Session information
 R version 4.0.3 (2020-10-10)
