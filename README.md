@@ -1,7 +1,7 @@
 # dp5.analysis
 
 ## Purpose
-The objective of this R Markdown code is to reproduce the building of the 5 dietary patterns (DP5) obtained via Dirichlet Multinomial Mixture (DMM) models in *Cotillard at al., A posteriori dietary patterns better explain variations of the gut microbiome than individual markers in the American Gut Project, accepted in AJCN.* It also includes code for associations with 16S gut microbiome using DESeq2.
+The objective of this R Markdown code is to reproduce the building of the 5 dietary patterns (DP5) obtained via Dirichlet Multinomial Mixture (DMM) models in *Cotillard at al., A posteriori dietary patterns better explain variations of the gut microbiome than individual markers in the American Gut Project, accepted in AJCN.* (https://doi.org/10.1093/ajcn/nqab332) It also includes code for associations with 16S gut microbiome using DESeq2.
 
 ## Usage
 Load all directories keeping the same organization and just run the .Rmd file after installing the require packages.
